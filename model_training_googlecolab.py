@@ -1,20 +1,3 @@
-"""
-train_fixed.py - leakage-free re-run of the ECSMP / SWEET identification experiments.
-
-Implements exactly the protocol described in the revised manuscript and response letter:
-  1. Each user's recording is kept in its original (chronological) row order - NO row shuffling.
-  2. Per user: first 70% of rows -> train, next 15% -> val, last 15% -> test.
-  3. Imputation means and z-score statistics are fitted on the TRAIN rows only.
-  4. Windows are generated inside each (user, split) block only (never across users or blocks).
-  5. Random oversampling is applied to TRAIN WINDOWS only (val/test keep original distribution).
-  6. Model selection on validation; test metrics reported once per run.
-  7. EER: one-vs-rest per user from softmax scores, macro mean AND standard deviation.
-
-Input: the per-user merged CSVs AFTER resampling and temperature fixing
-       (output of ecsmp_resampler.py / sweet_resampler.py + outlier_temp_data_fixer.py),
-       i.e. BEFORE data_validation.py (do NOT use the balanced_data folders: they were
-       imputed and oversampled before splitting).
-       Last column = user id, other columns = features, rows in time order.
 
 Example (Colab):
   !python train_fixed.py --data /content/drive/MyDrive/ecsmp_merged --dataset ECSMP \
