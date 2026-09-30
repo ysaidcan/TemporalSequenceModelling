@@ -1,359 +1,192 @@
-import os
-import random
+"""
+train_fixed.py - leakage-free re-run of the ECSMP / SWEET identification experiments.
+
+Implements exactly the protocol described in the revised manuscript and response letter:
+  1. Each user's recording is kept in its original (chronological) row order - NO row shuffling.
+  2. Per user: first 70% of rows -> train, next 15% -> val, last 15% -> test.
+  3. Imputation means and z-score statistics are fitted on the TRAIN rows only.
+  4. Windows are generated inside each (user, split) block only (never across users or blocks).
+  5. Random oversampling is applied to TRAIN WINDOWS only (val/test keep original distribution).
+  6. Model selection on validation; test metrics reported once per run.
+  7. EER: one-vs-rest per user from softmax scores, macro mean AND standard deviation.
+
+Input: the per-user merged CSVs AFTER resampling and temperature fixing
+       (output of ecsmp_resampler.py / sweet_resampler.py + outlier_temp_data_fixer.py),
+       i.e. BEFORE data_validation.py (do NOT use the balanced_data folders: they were
+       imputed and oversampled before splitting).
+       Last column = user id, other columns = features, rows in time order.
+
+Example (Colab):
+  !python train_fixed.py --data /content/drive/MyDrive/ecsmp_merged --dataset ECSMP \
+       --model lstm --layers 3 --units 256 --window 60 --stride 10 --seeds 42
+  !python train_fixed.py --data /content/drive/MyDrive/sweet_merged --dataset SWEET \
+       --model transformer --layers 5 --units 256 --window 60 --stride 10 --seeds 42
+Results are appended to results.jsonl; per-user EERs and class counts are saved as CSV.
+"""
+import argparse, glob, json, math, os, random, time
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import (LSTM, Dense, Input, Add,
-                                     LayerNormalization, GlobalAveragePooling1D,
-                                     MultiHeadAttention)
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from google.colab import drive
-from sklearn.metrics import classification_report, roc_curve
-
-import math
-
-# -------------------------------
-# CONFIG
-# -------------------------------
-
-if tf.config.list_physical_devices('GPU'):
-    print("Using GPU for training!")
-else:
-    print("GPU not detected. Check runtime settings or driver installation.")
-
-
-# Mount Google Drive
-drive.mount('/content/drive')
-
-# Update folder path
-data_path = '/content/drive/MyDrive/balanced_data_sweet'
-
-print(f"Data folder path: {data_path}")
-
-
-# Split ratios for each user
-train_ratio = 0.8  # 80% goes to (train+val), 20% goes to test
-val_ratio   = 0.2  # of the (train+val) portion, 20% goes to val
-# => net effect:  (train+val) = 80% of user data
-#                 val = 0.2 * 0.8 = 16% of total
-#                 train = 0.8 * 0.8 = 64% of total
-#                 test = 20% of total
-
-random_seed = 42
-timesteps = 60
-batch_size = 32
-epochs = 1
-
-# Choose which model architecture to use:
-use_transformer = False  # Set to False to revert to LSTM
-
-# Fix random seeds
-random.seed(random_seed)
-np.random.seed(random_seed)
-tf.random.set_seed(random_seed)
-
-# -------------------------------
-# 1. User-Wise Splitting per CSV
-# -------------------------------
-train_parts = []
-val_parts   = []
-test_parts  = []
-
-files = [os.path.join(data_path, f) for f in os.listdir(data_path) if f.endswith('.csv')]
-
-for file in files:
-    df = pd.read_csv(file)
-    # Assume last column is user ID
-    user_col_name = df.columns[-1]
-
-    # Group by each user in this CSV
-    for user_id, user_data in df.groupby(user_col_name):
-        # Shuffle each user's rows for random splitting
-        user_data = user_data.sample(frac=1.0, random_state=random_seed)
-
-        # 1) Split each user's data into train_val vs. test
-        cutoff_train_val = int(train_ratio * len(user_data))  # e.g. 80%
-        user_train_val = user_data.iloc[:cutoff_train_val]
-        user_test      = user_data.iloc[cutoff_train_val:]
-
-        # 2) Now split the train_val portion into train vs. val
-        cutoff_val = int(val_ratio * len(user_train_val))  # e.g. 20% of train_val
-        user_val   = user_train_val.iloc[:cutoff_val]
-        user_train = user_train_val.iloc[cutoff_val:]
-
-        # Accumulate
-        train_parts.append(user_train)
-        val_parts.append(user_val)
-        test_parts.append(user_test)
-
-# Concatenate all parts
-train_df = pd.concat(train_parts, ignore_index=True)
-val_df   = pd.concat(val_parts,   ignore_index=True)
-test_df  = pd.concat(test_parts,  ignore_index=True)
-
-# -------------------------------
-# 2. Extract Features & Labels
-# -------------------------------
-X_train = train_df.iloc[:, :-1].values
-y_train = train_df.iloc[:,  -1].values
-
-X_val   = val_df.iloc[:, :-1].values
-y_val   = val_df.iloc[:,  -1].values
-
-X_test  = test_df.iloc[:, :-1].values
-y_test  = test_df.iloc[:,  -1].values
-
-print("Train shape (raw):", X_train.shape,
-      "Val shape (raw):", X_val.shape,
-      "Test shape (raw):", X_test.shape)
-
-print("Unique users in train:", np.unique(y_train))
-print("Unique users in val:",   np.unique(y_val))
-print("Unique users in test:",  np.unique(y_test))
-
-# -------------------------------
-# 3. Scale & One-Hot Encode
-# -------------------------------
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_val   = scaler.transform(X_val)
-X_test  = scaler.transform(X_test)
-
-encoder = OneHotEncoder(sparse_output=False)
-y_train_encoded = encoder.fit_transform(y_train.reshape(-1, 1))
-y_val_encoded   = encoder.transform(y_val.reshape(-1, 1))
-y_test_encoded  = encoder.transform(y_test.reshape(-1, 1))
-
-num_features = X_train.shape[1]
-num_classes  = y_train_encoded.shape[1]
-print("Number of classes (users):", num_classes)
-
-# -------------------------------
-# 4. Generators for Sliding Windows
-# -------------------------------
-def windowed_batch_generator(X_data, y_data, timesteps= timesteps, batch_size=32, shuffle=True):
-    """
-    Infinite generator that yields batches of (X_window, y_window).
-    Each X_window => (batch_size, timesteps, num_features)
-    Each y_window => (batch_size, num_classes)
-    """
-    n_samples = len(X_data)
-    indices = np.arange(n_samples - timesteps)
-
-    while True:
-        if shuffle:
-            np.random.shuffle(indices)
-        for start in range(0, len(indices), batch_size):
-            batch_idx = indices[start:start + batch_size]
-            X_batch = np.array([X_data[i:i+timesteps] for i in batch_idx], dtype=np.float32)
-            y_batch = np.array([y_data[i+timesteps-1] for i in batch_idx], dtype=np.float32)
-            yield X_batch, y_batch
-
-def one_pass_window_generator(X_data, y_data, timesteps= timesteps, batch_size=32):
-    """
-    Single-pass generator (for test/eval).
-    """
-    n_samples = len(X_data)
-    indices = np.arange(n_samples - timesteps)
-
-    for start in range(0, len(indices), batch_size):
-        batch_idx = indices[start:start + batch_size]
-        X_batch = np.array([X_data[i:i+timesteps] for i in batch_idx], dtype=np.float32)
-        y_batch = np.array([y_data[i+timesteps-1] for i in batch_idx], dtype=np.float32)
-        yield X_batch, y_batch
-
-train_size = len(X_train)
-val_size   = len(X_val)
-test_size  = len(X_test)
-
-train_steps = (train_size - timesteps) // batch_size
-val_steps   = (val_size   - timesteps) // batch_size
-
-print(f"train_steps={train_steps}, val_steps={val_steps}")
-
-train_gen = windowed_batch_generator(X_train, y_train_encoded, timesteps, batch_size, shuffle=True)
-val_gen   = windowed_batch_generator(X_val,   y_val_encoded,   timesteps, batch_size, shuffle=False)
-
-# -------------------------------
-# 5A. Define LSTM Model
-# -------------------------------
-def build_lstm_model(timesteps, num_features, num_classes):
-    model = Sequential([
-        LSTM(64, input_shape=(timesteps, num_features), return_sequences=True),
-        LSTM(32),
-        Dense(16, activation='relu'),
-        Dense(num_classes, activation='softmax')
-    ])
-    model.compile(
-        optimizer='adam',
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    return model
-
-# -------------------------------
-# 5B. Define Transformer Model
-# -------------------------------
-def build_transformer_model(timesteps, num_features, num_classes, num_heads=4):
-    """
-    A simple Transformer encoder-based model for sequence classification.
-    """
-    inputs = tf.keras.Input(shape=(timesteps, num_features))
-
-    # Multi-Head Self-Attention
-    x = MultiHeadAttention(
-        num_heads=num_heads,
-        key_dim=num_features,
-        dropout=0.1
-    )(inputs, inputs)  # self-attention on "inputs"
-
-    # Residual & LayerNorm
-    x = Add()([x, inputs])
-    x = LayerNormalization(epsilon=1e-6)(x)
-
-    # Feed-forward network
-    ff = tf.keras.Sequential([
-        Dense(64, activation='relu'),
-        Dense(num_features),
-    ])
-    x_ff = ff(x)
-
-    # Residual & LayerNorm
-    x = Add()([x, x_ff])
-    x = LayerNormalization(epsilon=1e-6)(x)
-
-    # Pooling (global average)
-    x = GlobalAveragePooling1D()(x)
-
-    # Classification head
-    x = Dense(16, activation='relu')(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
-
-    model = tf.keras.Model(inputs, outputs)
-    model.compile(
-        optimizer='adam',
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    return model
-
-# -------------------------------
-# 5C. Choose Model & Train
-# -------------------------------
-if use_transformer:
-    print("\nUsing TRANSFORMER model...\n")
-    model = build_transformer_model(timesteps, num_features, num_classes, num_heads=4)
-else:
-    print("\nUsing LSTM model...\n")
-    model = build_lstm_model(timesteps, num_features, num_classes)
-
-with tf.device('/GPU:0'):
-    history = model.fit(
-        train_gen,
-        steps_per_epoch=train_steps,
-        validation_data=val_gen,
-        validation_steps=val_steps,
-        epochs=epochs
-    )
-
-# -------------------------------
-# 6. Evaluate on Test Set
-# -------------------------------
-test_steps = math.ceil((test_size - timesteps) / batch_size)
-test_gen = one_pass_window_generator(X_test, y_test_encoded, timesteps, batch_size)
-
-with tf.device('/GPU:0'):
-    loss, accuracy = model.evaluate(test_gen, steps=test_steps)
-print(f"Test Accuracy: {accuracy * 100:.2f}%")
-
-# -------------------------------
-# 7. Classification Report
-# -------------------------------
-y_pred_list = []
-y_true_list = []
-
-test_gen2 = one_pass_window_generator(X_test, y_test_encoded, timesteps, batch_size)
-for X_batch, y_batch in test_gen2:
-    preds = model.predict(X_batch, verbose = 0)
-    y_pred_batch = np.argmax(preds, axis=1)
-    y_true_batch = np.argmax(y_batch, axis=1)
-    y_pred_list.append(y_pred_batch)
-    y_true_list.append(y_true_batch)
-
-y_pred_final = np.concatenate(y_pred_list)
-y_true_final = np.concatenate(y_true_list)
-
-# Convert numeric user IDs to strings to avoid TypeError in classification_report
-class_names_str = [str(cls) for cls in encoder.categories_[0]]
-
-report = classification_report(y_true_final, y_pred_final, target_names=class_names_str)
-print(report)
-
-# -------------------------------
-# 8. EER Calculation
-# -------------------------------
-
-from joblib import Parallel, delayed
-
-def compute_eer_for_one_class(c, y_true, y_scores):
-    """
-    Binary classification for class c vs. all others.
-    """
-    # Create binary labels: 1 if class = c, else 0
-    y_true_bin = (y_true == c).astype(int)
-    # Extract probabilities for class c
-    y_scores_bin = y_scores[:, c]
-
-    # Compute FPR/TPR for various thresholds
-    fpr, tpr, _ = roc_curve(y_true_bin, y_scores_bin)
-    fnr = 1 - tpr
-
-    # Find the threshold index where FPR and FNR are closest
-    abs_diff = np.abs(fpr - fnr)
-    idx = np.argmin(abs_diff)
-
-    # Equal Error Rate = average of FPR and FNR at that point
-    eer_val = (fpr[idx] + fnr[idx]) / 2.0
-    return c, eer_val
-
-def compute_eer_per_class_parallel(y_true, y_scores, n_classes, n_jobs=-1):
-    """
-    Parallelizes EER computation for each class using joblib.
-
-    :param y_true: 1D array of shape (num_samples,) with integer class labels.
-    :param y_scores: 2D array of shape (num_samples, num_classes) with
-                     predicted probabilities for each class.
-    :param n_classes: number of classes (users)
-    :param n_jobs: number of parallel jobs (default=-1 uses all cores)
-    :return: dict {class_index: EER_value}
-    """
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(compute_eer_for_one_class)(c, y_true, y_scores)
-        for c in range(n_classes)
-    )
-    # Convert list of (class_idx, eer_val) to a dict
-    return dict(results)
-
-# 1) Gather predicted probabilities for entire test set
-test_gen3 = one_pass_window_generator(X_test, y_test_encoded, timesteps, batch_size)
-y_scores_list = []
-
-for X_batch, _ in test_gen3:
-    # Predict probabilities for this batch
-    preds_prob = model.predict(X_batch, verbose=0)  # shape: (batch_size, num_classes)
-    y_scores_list.append(preds_prob)
-
-# 2) Concatenate into a single array, shape = (num_test_samples, num_classes)
-all_y_scores = np.concatenate(y_scores_list, axis=0)
-
-# 3) Compute EER in parallel
-eers_dict = compute_eer_per_class_parallel(y_true_final, all_y_scores, num_classes, n_jobs=-1)
-
-# 4) Print EER results
-print("\nEqual Error Rate (EER) per class (one-vs-rest):")
-for c in sorted(eers_dict.keys()):
-    print(f"  Class {class_names_str[c]} => EER: {eers_dict[c]*100:.2f}%")
-
-avg_eer = sum(eers_dict.values()) / len(eers_dict)
-print(f"\nAverage EER across classes: {avg_eer*100:.2f}%")
+from sklearn.metrics import roc_curve, f1_score
+
+p = argparse.ArgumentParser()
+p.add_argument('--data', required=True)
+p.add_argument('--dataset', required=True, help='label written to results, e.g. ECSMP or SWEET')
+p.add_argument('--model', choices=['lstm', 'transformer'], required=True)
+p.add_argument('--layers', type=int, default=3, help='LSTM layers, or dense layers in the Transformer feed-forward block')
+p.add_argument('--units', type=int, default=256)
+p.add_argument('--window', type=int, default=60, help='window length in samples (= seconds at 1 Hz)')
+p.add_argument('--stride', type=int, default=10, help='window stride in samples')
+p.add_argument('--split', type=float, nargs=3, default=[0.70, 0.15, 0.15])
+p.add_argument('--batch', type=int, default=64)
+p.add_argument('--epochs', type=int, default=100)
+p.add_argument('--patience', type=int, default=5)
+p.add_argument('--lr', type=float, default=1e-3)
+p.add_argument('--dropout', type=float, default=0.1)
+p.add_argument('--no_pos_enc', action='store_true', help='disable sinusoidal positional encoding (Transformer)')
+p.add_argument('--seeds', type=int, nargs='+', default=[42])
+p.add_argument('--out', default='results')
+a = p.parse_args()
+os.makedirs(a.out, exist_ok=True)
+
+# ---------------------------------------------------------------- 1. load, chronological split
+files = sorted(glob.glob(os.path.join(a.data, '*.csv')))
+blocks = {'train': [], 'val': [], 'test': []}          # list of (user_id, np.array rows)
+feat_cols = None
+for f in files:
+    df = pd.read_csv(f)
+    if feat_cols is None:
+        feat_cols = list(df.columns[:-1])
+    for uid, ud in df.groupby(df.columns[-1], sort=False):
+        X = ud[feat_cols].to_numpy(dtype=np.float32)       # original row order kept
+        n = len(X)
+        c1 = int(a.split[0] * n); c2 = int((a.split[0] + a.split[1]) * n)
+        blocks['train'].append((uid, X[:c1]))
+        blocks['val'].append((uid, X[c1:c2]))
+        blocks['test'].append((uid, X[c2:]))
+users = sorted({u for u, _ in blocks['train']})
+uid2idx = {u: i for i, u in enumerate(users)}
+C = len(users)
+print(f'{len(files)} files, {C} users, features: {feat_cols}')
+
+# ---------------------------------------------------------------- 2. train-only imputation + scaling
+train_all = np.concatenate([x for _, x in blocks['train']])
+mu_imp = np.nanmean(train_all, axis=0)
+missing_pct = {s: float(np.mean(np.isnan(np.concatenate([x for _, x in blocks[s]])))) * 100 for s in blocks}
+def impute(x):
+    x = x.copy(); r, c = np.where(np.isnan(x)); x[r, c] = mu_imp[c]; return x
+train_imp = impute(train_all)
+mu, sd = train_imp.mean(0), train_imp.std(0) + 1e-8
+for s in blocks:
+    blocks[s] = [(u, (impute(x) - mu) / sd) for u, x in blocks[s]]
+
+# ---------------------------------------------------------------- 3. windows inside each block
+def make_index(split):
+    arrs, idx = [], []
+    for u, x in blocks[split]:
+        k = len(arrs); arrs.append(x)
+        starts = np.arange(0, len(x) - a.window + 1, a.stride)
+        idx.append(np.stack([np.full(len(starts), k), starts, np.full(len(starts), uid2idx[u])], 1))
+    idx = np.concatenate(idx) if idx else np.zeros((0, 3), int)
+    return arrs, idx
+
+class WinSeq(tf.keras.utils.Sequence):
+    def __init__(self, arrs, idx, shuffle, seed):
+        super().__init__(); self.arrs, self.idx, self.shuffle = arrs, idx.copy(), shuffle
+        self.rng = np.random.default_rng(seed); self.on_epoch_end()
+    def __len__(self): return math.ceil(len(self.idx) / a.batch)
+    def __getitem__(self, i):
+        b = self.idx[i * a.batch:(i + 1) * a.batch]
+        X = np.stack([self.arrs[k][s:s + a.window] for k, s, _ in b]).astype(np.float32)
+        return X, b[:, 2]
+    def on_epoch_end(self):
+        if self.shuffle: self.rng.shuffle(self.idx)
+
+# ---------------------------------------------------------------- 4. models
+def build_lstm(F):
+    m = tf.keras.Sequential([tf.keras.Input((a.window, F))])
+    for i in range(a.layers):
+        m.add(tf.keras.layers.LSTM(a.units, return_sequences=i < a.layers - 1))
+    m.add(tf.keras.layers.Dense(16, activation='relu'))
+    m.add(tf.keras.layers.Dense(C, activation='softmax'))
+    return m
+
+def pos_encoding(T, F):
+    pos = np.arange(T)[:, None]; i = np.arange(F)[None, :]
+    ang = pos / np.power(10000, (2 * (i // 2)) / F)
+    pe = np.where(i % 2 == 0, np.sin(ang), np.cos(ang))
+    return tf.constant(pe[None], dtype=tf.float32)
+
+def build_transformer(F):
+    L = tf.keras.layers
+    inp = tf.keras.Input((a.window, F)); x = inp
+    if not a.no_pos_enc:
+        x = x + pos_encoding(a.window, F)
+    att = L.MultiHeadAttention(num_heads=4, key_dim=F, dropout=a.dropout)(x, x)
+    x = L.LayerNormalization(epsilon=1e-6)(L.Add()([x, att]))
+    ff = x
+    for _ in range(a.layers):
+        ff = L.Dense(a.units, activation='relu')(ff)
+    ff = L.Dropout(a.dropout)(L.Dense(F)(ff))
+    x = L.LayerNormalization(epsilon=1e-6)(L.Add()([x, ff]))
+    x = L.GlobalAveragePooling1D()(x)
+    x = L.Dense(16, activation='relu')(x)
+    return tf.keras.Model(inp, L.Dense(C, activation='softmax')(x))
+
+# ---------------------------------------------------------------- 5. EER (same definition as original code)
+def eer_per_class(y, S):
+    out = []
+    for c in range(C):
+        yb = (y == c).astype(int)
+        if yb.sum() == 0 or yb.sum() == len(yb): out.append(np.nan); continue
+        fpr, tpr, _ = roc_curve(yb, S[:, c]); fnr = 1 - tpr
+        j = np.argmin(np.abs(fpr - fnr)); out.append((fpr[j] + fnr[j]) / 2)
+    return np.array(out)
+
+# ---------------------------------------------------------------- 6. run
+tr_arrs, tr_idx = make_index('train'); va_arrs, va_idx = make_index('val'); te_arrs, te_idx = make_index('test')
+counts = pd.DataFrame({'user': users,
+                       'train_windows_before': np.bincount(tr_idx[:, 2], minlength=C),
+                       'val_windows': np.bincount(va_idx[:, 2], minlength=C),
+                       'test_windows': np.bincount(te_idx[:, 2], minlength=C)})
+# random oversampling of TRAIN windows only
+target = counts.train_windows_before.max()
+rng0 = np.random.default_rng(0); parts = []
+for c in range(C):
+    rows = tr_idx[tr_idx[:, 2] == c]
+    if len(rows) == 0: continue
+    extra = rows[rng0.integers(0, len(rows), target - len(rows))] if len(rows) < target else rows[:0]
+    parts += [rows, extra]
+tr_idx_os = np.concatenate(parts)
+counts['train_windows_after'] = np.bincount(tr_idx_os[:, 2], minlength=C)
+tag = f'{a.dataset}_{a.model}_L{a.layers}_U{a.units}_W{a.window}_S{a.stride}'
+counts.to_csv(os.path.join(a.out, f'class_counts_{tag}.csv'), index=False)
+
+for seed in a.seeds:
+    random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+    F = len(feat_cols)
+    model = build_lstm(F) if a.model == 'lstm' else build_transformer(F)
+    model.compile(optimizer=tf.keras.optimizers.Adam(a.lr), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    t0 = time.time()
+    h = model.fit(WinSeq(tr_arrs, tr_idx_os, True, seed), validation_data=WinSeq(va_arrs, va_idx, False, seed),
+                  epochs=a.epochs, verbose=2,
+                  callbacks=[tf.keras.callbacks.EarlyStopping('val_loss', patience=a.patience, restore_best_weights=True)])
+    best = int(np.argmin(h.history['val_loss']))
+    S = model.predict(WinSeq(te_arrs, te_idx, False, seed), verbose=0)
+    y = te_idx[:, 2]; yp = S.argmax(1)
+    eers = eer_per_class(y, S)
+    pd.DataFrame({'user': users, 'eer': eers}).to_csv(os.path.join(a.out, f'eer_per_user_{tag}_seed{seed}.csv'), index=False)
+    res = dict(dataset=a.dataset, model=a.model, layers=a.layers, units=a.units, window=a.window, stride=a.stride,
+               seed=seed, n_users=C, features=feat_cols, epochs_run=len(h.history['loss']), best_epoch=best + 1,
+               train_loss=float(h.history['loss'][best]), train_acc=float(h.history['accuracy'][best]),
+               val_acc=float(h.history['val_accuracy'][best]),
+               test_acc=float((yp == y).mean()), test_macro_f1=float(f1_score(y, yp, average='macro')),
+               eer_mean=float(np.nanmean(eers)), eer_sd=float(np.nanstd(eers)), eer_max=float(np.nanmax(eers)),
+               missing_pct=missing_pct, n_windows=dict(train_before=int(len(tr_idx)), train_after=int(len(tr_idx_os)),
+                                                       val=int(len(va_idx)), test=int(len(te_idx))),
+               hyper=dict(batch=a.batch, lr=a.lr, patience=a.patience, dropout=a.dropout,
+                          pos_enc=(a.model == 'transformer' and not a.no_pos_enc)),
+               minutes=round((time.time() - t0) / 60, 1))
+    print(json.dumps(res, indent=1))
+    with open(os.path.join(a.out, 'results.jsonl'), 'a') as fh:
+        fh.write(json.dumps(res) + '\n')
